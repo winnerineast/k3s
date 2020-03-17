@@ -20,6 +20,7 @@ import (
 	"sync"
 
 	"github.com/containerd/containerd"
+	"github.com/containerd/cri/pkg/store/label"
 	"github.com/docker/docker/pkg/truncindex"
 
 	"github.com/containerd/cri/pkg/netns"
@@ -62,13 +63,15 @@ type Store struct {
 	lock      sync.RWMutex
 	sandboxes map[string]Sandbox
 	idIndex   *truncindex.TruncIndex
+	labels    *label.Store
 }
 
 // NewStore creates a sandbox store.
-func NewStore() *Store {
+func NewStore(labels *label.Store) *Store {
 	return &Store{
 		sandboxes: make(map[string]Sandbox),
 		idIndex:   truncindex.NewTruncIndex([]string{}),
+		labels:    labels,
 	}
 }
 
@@ -79,6 +82,9 @@ func (s *Store) Add(sb Sandbox) error {
 	if _, ok := s.sandboxes[sb.ID]; ok {
 		return store.ErrAlreadyExist
 	}
+	if err := s.labels.Reserve(sb.ProcessLabel); err != nil {
+		return err
+	}
 	if err := s.idIndex.Add(sb.ID); err != nil {
 		return err
 	}
@@ -86,22 +92,9 @@ func (s *Store) Add(sb Sandbox) error {
 	return nil
 }
 
-// Get returns the sandbox with specified id. Returns store.ErrNotExist
-// if the sandbox doesn't exist.
+// Get returns the sandbox with specified id.
+// Returns store.ErrNotExist if the sandbox doesn't exist.
 func (s *Store) Get(id string) (Sandbox, error) {
-	sb, err := s.GetAll(id)
-	if err != nil {
-		return sb, err
-	}
-	if sb.Status.Get().State == StateInit {
-		return Sandbox{}, store.ErrNotExist
-	}
-	return sb, nil
-}
-
-// GetAll returns the sandbox with specified id, including sandbox in unknown
-// state. Returns store.ErrNotExist if the sandbox doesn't exist.
-func (s *Store) GetAll(id string) (Sandbox, error) {
 	s.lock.RLock()
 	defer s.lock.RUnlock()
 	id, err := s.idIndex.Get(id)
@@ -123,9 +116,6 @@ func (s *Store) List() []Sandbox {
 	defer s.lock.RUnlock()
 	var sandboxes []Sandbox
 	for _, sb := range s.sandboxes {
-		if sb.Status.Get().State == StateInit {
-			continue
-		}
 		sandboxes = append(sandboxes, sb)
 	}
 	return sandboxes
@@ -141,6 +131,7 @@ func (s *Store) Delete(id string) {
 		// So we need to return if there are error.
 		return
 	}
+	s.labels.Release(s.sandboxes[id].ProcessLabel)
 	s.idIndex.Delete(id) // nolint: errcheck
 	delete(s.sandboxes, id)
 }

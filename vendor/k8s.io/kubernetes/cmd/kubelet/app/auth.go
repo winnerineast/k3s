@@ -26,9 +26,10 @@ import (
 	"k8s.io/apiserver/pkg/authentication/authenticatorfactory"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	"k8s.io/apiserver/pkg/authorization/authorizerfactory"
+	"k8s.io/apiserver/pkg/server/dynamiccertificates"
 	clientset "k8s.io/client-go/kubernetes"
 	authenticationclient "k8s.io/client-go/kubernetes/typed/authentication/v1"
-	authorizationclient "k8s.io/client-go/kubernetes/typed/authorization/v1beta1"
+	authorizationclient "k8s.io/client-go/kubernetes/typed/authorization/v1"
 
 	kubeletconfig "k8s.io/kubernetes/pkg/kubelet/apis/config"
 	"k8s.io/kubernetes/pkg/kubelet/server"
@@ -43,7 +44,7 @@ func BuildAuth(nodeName types.NodeName, client clientset.Interface, config kubel
 	)
 	if client != nil && !reflect.ValueOf(client).IsNil() {
 		tokenClient = client.AuthenticationV1().TokenReviews()
-		sarClient = client.AuthorizationV1beta1().SubjectAccessReviews()
+		sarClient = client.AuthorizationV1().SubjectAccessReviews()
 	}
 
 	authenticator, err := BuildAuthn(tokenClient, config.Authentication)
@@ -63,9 +64,19 @@ func BuildAuth(nodeName types.NodeName, client clientset.Interface, config kubel
 
 // BuildAuthn creates an authenticator compatible with the kubelet's needs
 func BuildAuthn(client authenticationclient.TokenReviewInterface, authn kubeletconfig.KubeletAuthentication) (authenticator.Request, error) {
+	var clientCertificateCAContentProvider authenticatorfactory.CAContentProvider
+	var err error
+	if len(authn.X509.ClientCAFile) > 0 {
+		clientCertificateCAContentProvider, err = dynamiccertificates.NewDynamicCAContentFromFile("client-ca-bundle", authn.X509.ClientCAFile)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	authenticatorConfig := authenticatorfactory.DelegatingAuthenticatorConfig{
-		CacheTTL:     authn.Webhook.CacheTTL.Duration,
-		ClientCAFile: authn.X509.ClientCAFile,
+		Anonymous:                          authn.Anonymous.Enabled,
+		CacheTTL:                           authn.Webhook.CacheTTL.Duration,
+		ClientCertificateCAContentProvider: clientCertificateCAContentProvider,
 	}
 
 	if authn.Webhook.Enabled {
@@ -75,7 +86,8 @@ func BuildAuthn(client authenticationclient.TokenReviewInterface, authn kubeletc
 		authenticatorConfig.TokenAccessReviewClient = client
 	}
 
-	return authenticatorConfig.New()
+	authenticator, _, err := authenticatorConfig.New()
+	return authenticator, err
 }
 
 // BuildAuthz creates an authorizer compatible with the kubelet's needs
@@ -96,10 +108,10 @@ func BuildAuthz(client authorizationclient.SubjectAccessReviewInterface, authz k
 		return authorizerConfig.New()
 
 	case "":
-		return nil, fmt.Errorf("No authorization mode specified")
+		return nil, fmt.Errorf("no authorization mode specified")
 
 	default:
-		return nil, fmt.Errorf("Unknown authorization mode %s", authz.Mode)
+		return nil, fmt.Errorf("unknown authorization mode %s", authz.Mode)
 
 	}
 }

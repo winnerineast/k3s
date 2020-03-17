@@ -1,3 +1,5 @@
+// +build !windows
+
 package rootless
 
 import (
@@ -13,7 +15,7 @@ import (
 	"github.com/rootless-containers/rootlesskit/pkg/copyup/tmpfssymlink"
 	"github.com/rootless-containers/rootlesskit/pkg/network/slirp4netns"
 	"github.com/rootless-containers/rootlesskit/pkg/parent"
-	"github.com/rootless-containers/rootlesskit/pkg/port/socat"
+	portbuiltin "github.com/rootless-containers/rootlesskit/pkg/port/builtin"
 	"github.com/sirupsen/logrus"
 )
 
@@ -89,7 +91,8 @@ func createParentOpt(stateDir string) (*parent.Opt, error) {
 	}
 
 	opt := &parent.Opt{
-		StateDir: stateDir,
+		StateDir:    stateDir,
+		CreatePIDNS: true,
 	}
 
 	mtu := 0
@@ -102,8 +105,8 @@ func createParentOpt(stateDir string) (*parent.Opt, error) {
 	if _, err := exec.LookPath(binary); err != nil {
 		return nil, err
 	}
-	opt.NetworkDriver = slirp4netns.NewParentDriver(binary, mtu, ipnet, disableHostLoopback, "")
-	opt.PortDriver, err = socat.NewParentDriver(&logrusDebugWriter{})
+	opt.NetworkDriver = slirp4netns.NewParentDriver(binary, mtu, ipnet, disableHostLoopback, "", false, false)
+	opt.PortDriver, err = portbuiltin.NewParentDriver(&logrusDebugWriter{}, stateDir)
 	if err != nil {
 		return nil, err
 	}
@@ -127,7 +130,10 @@ func createChildOpt() (*child.Opt, error) {
 	opt.TargetCmd = os.Args
 	opt.PipeFDEnvKey = pipeFD
 	opt.NetworkDriver = slirp4netns.NewChildDriver()
-	opt.CopyUpDirs = []string{"/etc", "/run"}
+	opt.PortDriver = portbuiltin.NewChildDriver(&logrusDebugWriter{})
+	opt.CopyUpDirs = []string{"/etc", "/run", "/var/lib"}
 	opt.CopyUpDriver = tmpfssymlink.NewChildDriver()
+	opt.MountProcfs = true
+	opt.Reaper = true
 	return opt, nil
 }

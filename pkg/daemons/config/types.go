@@ -5,18 +5,31 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 
+	"github.com/rancher/kine/pkg/endpoint"
+	"github.com/rancher/wrangler-api/pkg/generated/controllers/core"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
+)
+
+const (
+	FlannelBackendNone      = "none"
+	FlannelBackendVXLAN     = "vxlan"
+	FlannelBackendHostGW    = "host-gw"
+	FlannelBackendIPSEC     = "ipsec"
+	FlannelBackendWireguard = "wireguard"
 )
 
 type Node struct {
 	Docker                   bool
 	ContainerRuntimeEndpoint string
 	NoFlannel                bool
+	DisableSELinux           bool
+	FlannelBackend           string
 	FlannelConf              string
+	FlannelConfOverride      bool
 	FlannelIface             *net.Interface
-	LocalAddress             string
 	Containerd               Containerd
 	Images                   string
 	AgentConfig              Agent
@@ -36,74 +49,135 @@ type Containerd struct {
 }
 
 type Agent struct {
-	NodeName           string
-	NodeCertFile       string
-	NodeKeyFile        string
-	ClusterCIDR        net.IPNet
-	ClusterDNS         net.IP
-	ClusterDomain      string
-	ResolvConf         string
-	RootDir            string
-	KubeConfig         string
-	NodeIP             string
-	RuntimeSocket      string
-	ListenAddress      string
-	CACertPath         string
-	CNIBinDir          string
-	CNIConfDir         string
-	ExtraKubeletArgs   []string
-	ExtraKubeProxyArgs []string
+	NodeName                string
+	NodeConfigPath          string
+	ServingKubeletCert      string
+	ServingKubeletKey       string
+	ClusterCIDR             net.IPNet
+	ClusterDNS              net.IP
+	ClusterDomain           string
+	ResolvConf              string
+	RootDir                 string
+	KubeConfigKubelet       string
+	KubeConfigKubeProxy     string
+	KubeConfigK3sController string
+	NodeIP                  string
+	NodeExternalIP          string
+	RuntimeSocket           string
+	ListenAddress           string
+	ClientCA                string
+	CNIBinDir               string
+	CNIConfDir              string
+	ExtraKubeletArgs        []string
+	ExtraKubeProxyArgs      []string
+	PauseImage              string
+	CNIPlugin               bool
+	NodeTaints              []string
+	NodeLabels              []string
+	IPSECPSK                string
+	StrongSwanDir           string
+	PrivateRegistry         string
+	DisableCCM              bool
+	DisableNPC              bool
+	Rootless                bool
 }
 
 type Control struct {
-	AdvertisePort         int
-	ListenPort            int
-	ClusterSecret         string
-	ClusterIPRange        *net.IPNet
-	ServiceIPRange        *net.IPNet
-	ClusterDNS            net.IP
-	ClusterDomain         string
-	NoCoreDNS             bool
-	KubeConfigOutput      string
-	KubeConfigMode        string
-	DataDir               string
-	Skips                 []string
-	ETCDEndpoints         []string
-	ETCDKeyFile           string
-	ETCDCertFile          string
-	ETCDCAFile            string
-	NoScheduler           bool
-	ExtraAPIArgs          []string
-	ExtraControllerArgs   []string
-	ExtraSchedulerAPIArgs []string
-	NoLeaderElect         bool
+	AdvertisePort            int
+	AdvertiseIP              string
+	ListenPort               int
+	HTTPSPort                int
+	AgentToken               string
+	Token                    string
+	ClusterIPRange           *net.IPNet
+	ServiceIPRange           *net.IPNet
+	ClusterDNS               net.IP
+	ClusterDomain            string
+	NoCoreDNS                bool
+	KubeConfigOutput         string
+	KubeConfigMode           string
+	DataDir                  string
+	Skips                    map[string]bool
+	Disables                 map[string]bool
+	Datastore                endpoint.Config
+	NoScheduler              bool
+	ExtraAPIArgs             []string
+	ExtraControllerArgs      []string
+	ExtraCloudControllerArgs []string
+	ExtraSchedulerAPIArgs    []string
+	NoLeaderElect            bool
+	JoinURL                  string
+	FlannelBackend           string
+	IPSECPSK                 string
+	DefaultLocalStoragePath  string
+	DisableCCM               bool
+	DisableNPC               bool
+	ClusterInit              bool
+	ClusterReset             bool
+	EncryptSecrets           bool
+
+	BindAddress string
+	SANs        []string
 
 	Runtime *ControlRuntime `json:"-"`
 }
 
+type ControlRuntimeBootstrap struct {
+	ServerCA           string
+	ServerCAKey        string
+	ClientCA           string
+	ClientCAKey        string
+	ServiceKey         string
+	PasswdFile         string
+	RequestHeaderCA    string
+	RequestHeaderCAKey string
+	IPSECKey           string
+	EncryptionConfig   string
+}
+
 type ControlRuntime struct {
-	TLSCert          string
-	TLSKey           string
-	TLSCA            string
-	TLSCAKey         string
-	TokenCA          string
-	TokenCAKey       string
-	ServiceKey       string
-	PasswdFile       string
-	KubeConfigSystem string
+	ControlRuntimeBootstrap
 
-	NodeCert      string
-	NodeKey       string
-	ClientToken   string
-	NodeToken     string
-	Handler       http.Handler
-	Tunnel        http.Handler
-	Authenticator authenticator.Request
+	HTTPBootstrap bool
 
-	RequestHeaderCA     string
-	RequestHeaderCAKey  string
+	ClientKubeAPICert string
+	ClientKubeAPIKey  string
+	NodePasswdFile    string
+
+	KubeConfigAdmin           string
+	KubeConfigController      string
+	KubeConfigScheduler       string
+	KubeConfigAPIServer       string
+	KubeConfigCloudController string
+
+	ServingKubeAPICert string
+	ServingKubeAPIKey  string
+	ServingKubeletKey  string
+	ClientToken        string
+	ServerToken        string
+	AgentToken         string
+	Handler            http.Handler
+	Tunnel             http.Handler
+	Authenticator      authenticator.Request
+
 	ClientAuthProxyCert string
 	ClientAuthProxyKey  string
+
+	ClientAdminCert           string
+	ClientAdminKey            string
+	ClientControllerCert      string
+	ClientControllerKey       string
+	ClientSchedulerCert       string
+	ClientSchedulerKey        string
+	ClientKubeProxyCert       string
+	ClientKubeProxyKey        string
+	ClientKubeletKey          string
+	ClientCloudControllerCert string
+	ClientCloudControllerKey  string
+	ClientK3sControllerCert   string
+	ClientK3sControllerKey    string
+
+	Core *core.Factory
 }
 
 type ArgString []string
@@ -134,5 +208,6 @@ func GetArgsList(argsMap map[string]string, extraArgs []string) []string {
 		cmd := fmt.Sprintf("--%s=%s", arg, value)
 		args = append(args, cmd)
 	}
+	sort.Strings(args)
 	return args
 }

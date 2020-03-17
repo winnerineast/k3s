@@ -8,19 +8,20 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"syscall"
 	"time"
 
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/namespaces"
 	"github.com/natefinch/lumberjack"
 	"github.com/opencontainers/runc/libcontainer/system"
+	"github.com/pkg/errors"
 	"github.com/rancher/k3s/pkg/agent/templates"
 	util2 "github.com/rancher/k3s/pkg/agent/util"
 	"github.com/rancher/k3s/pkg/daemons/config"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
-	runtimeapi "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
+	yaml "gopkg.in/yaml.v2"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 	"k8s.io/kubernetes/pkg/kubelet/util"
 )
 
@@ -65,9 +66,7 @@ func Run(ctx context.Context, cfg *config.Node) error {
 		cmd := exec.Command(args[0], args[1:]...)
 		cmd.Stdout = stdOut
 		cmd.Stderr = stdErr
-		cmd.SysProcAttr = &syscall.SysProcAttr{
-			Pdeathsig: syscall.SIGKILL,
-		}
+		addDeathSig(cmd)
 		if err := cmd.Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "containerd: %s\n", err)
 		}
@@ -75,13 +74,13 @@ func Run(ctx context.Context, cfg *config.Node) error {
 	}()
 
 	for {
-		addr, dailer, err := util.GetAddressAndDialer("unix://" + cfg.Containerd.Address)
+		addr, dialer, err := util.GetAddressAndDialer("unix://" + cfg.Containerd.Address)
 		if err != nil {
 			time.Sleep(1 * time.Second)
 			continue
 		}
 
-		conn, err := grpc.Dial(addr, grpc.WithInsecure(), grpc.WithTimeout(3*time.Second), grpc.WithDialer(dailer), grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxMsgSize)))
+		conn, err := grpc.Dial(addr, grpc.WithInsecure(), grpc.WithTimeout(3*time.Second), grpc.WithDialer(dialer), grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxMsgSize)))
 		if err != nil {
 			time.Sleep(1 * time.Second)
 			continue
@@ -158,10 +157,31 @@ func preloadImages(cfg *config.Node) error {
 }
 
 func setupContainerdConfig(ctx context.Context, cfg *config.Node) error {
+	privRegistries, err := getPrivateRegistries(ctx, cfg)
+	if err != nil {
+		return err
+	}
 	var containerdTemplate string
 	containerdConfig := templates.ContainerdConfig{
-		NodeConfig:        cfg,
-		IsRunningInUserNS: system.RunningInUserNS(),
+		NodeConfig:            cfg,
+		IsRunningInUserNS:     system.RunningInUserNS(),
+		PrivateRegistryConfig: privRegistries,
+	}
+
+	selEnabled, selConfigured, err := selinuxStatus()
+	if err != nil {
+		return errors.Wrap(err, "failed to detect selinux")
+	}
+	if cfg.DisableSELinux {
+		containerdConfig.SELinuxEnabled = false
+		if selEnabled {
+			logrus.Warn("SELinux is enabled for system but has been disabled for containerd by override")
+		}
+	} else {
+		containerdConfig.SELinuxEnabled = selEnabled
+	}
+	if containerdConfig.SELinuxEnabled && !selConfigured {
+		logrus.Warnf("SELinux is enabled for k3s but process is not running in context '%s', k3s-selinux policy may need to be applied", SELinuxContextType)
 	}
 
 	containerdTemplateBytes, err := ioutil.ReadFile(cfg.Containerd.Template)
@@ -179,4 +199,20 @@ func setupContainerdConfig(ctx context.Context, cfg *config.Node) error {
 	}
 
 	return util2.WriteFile(cfg.Containerd.Config, parsedTemplate)
+}
+
+func getPrivateRegistries(ctx context.Context, cfg *config.Node) (*templates.Registry, error) {
+	privRegistries := &templates.Registry{}
+	privRegistryFile, err := ioutil.ReadFile(cfg.AgentConfig.PrivateRegistry)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	logrus.Infof("Using registry config file at %s", cfg.AgentConfig.PrivateRegistry)
+	if err := yaml.Unmarshal(privRegistryFile, &privRegistries); err != nil {
+		return nil, err
+	}
+	return privRegistries, nil
 }

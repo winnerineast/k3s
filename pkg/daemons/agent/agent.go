@@ -14,57 +14,60 @@ import (
 	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/component-base/logs"
-	app2 "k8s.io/kubernetes/cmd/kube-proxy/app"
-	"k8s.io/kubernetes/cmd/kubelet/app"
+	proxy "k8s.io/kubernetes/cmd/kube-proxy/app"
+	kubelet "k8s.io/kubernetes/cmd/kubelet/app"
 	"k8s.io/kubernetes/pkg/kubeapiserver/authorizer/modes"
 
-	_ "k8s.io/kubernetes/pkg/client/metrics/prometheus" // for client metric registration
-	_ "k8s.io/kubernetes/pkg/version/prometheus"        // for version metric registration
+	_ "k8s.io/component-base/metrics/prometheus/restclient" // for client metric registration
+	_ "k8s.io/component-base/metrics/prometheus/version"    // for version metric registration
 )
 
 func Agent(config *config.Agent) error {
 	rand.Seed(time.Now().UTC().UnixNano())
 
-	kubelet(config)
-	kubeProxy(config)
+	logs.InitLogs()
+	defer logs.FlushLogs()
+
+	startKubelet(config)
+	startKubeProxy(config)
 
 	return nil
 }
 
-func kubeProxy(cfg *config.Agent) {
+func startKubeProxy(cfg *config.Agent) {
 	argsMap := map[string]string{
 		"proxy-mode":           "iptables",
 		"healthz-bind-address": "127.0.0.1",
-		"kubeconfig":           cfg.KubeConfig,
+		"kubeconfig":           cfg.KubeConfigKubeProxy,
 		"cluster-cidr":         cfg.ClusterCIDR.String(),
 	}
-	args := config.GetArgsList(argsMap, cfg.ExtraKubeProxyArgs)
+	if cfg.NodeName != "" {
+		argsMap["hostname-override"] = cfg.NodeName
+	}
 
-	command := app2.NewProxyCommand()
+	args := config.GetArgsList(argsMap, cfg.ExtraKubeProxyArgs)
+	command := proxy.NewProxyCommand()
 	command.SetArgs(args)
+
 	go func() {
-		err := command.Execute()
-		logrus.Fatalf("kube-proxy exited: %v", err)
+		logrus.Infof("Running kube-proxy %s", config.ArgString(args))
+		logrus.Fatalf("kube-proxy exited: %v", command.Execute())
 	}()
 }
 
-func kubelet(cfg *config.Agent) {
-	command := app.NewKubeletCommand(context.Background().Done())
-	logs.InitLogs()
-	defer logs.FlushLogs()
-
+func startKubelet(cfg *config.Agent) {
 	argsMap := map[string]string{
 		"healthz-bind-address":     "127.0.0.1",
 		"read-only-port":           "0",
-		"allow-privileged":         "true",
 		"cluster-domain":           cfg.ClusterDomain,
-		"kubeconfig":               cfg.KubeConfig,
+		"kubeconfig":               cfg.KubeConfigKubelet,
 		"eviction-hard":            "imagefs.available<5%,nodefs.available<5%",
 		"eviction-minimum-reclaim": "imagefs.available=10%,nodefs.available=10%",
 		"fail-swap-on":             "false",
 		//"cgroup-root": "/k3s",
 		"cgroup-driver":                "cgroupfs",
 		"authentication-token-webhook": "true",
+		"anonymous-auth":               "false",
 		"authorization-mode":           modes.ModeWebhook,
 	}
 	if cfg.RootDir != "" {
@@ -78,6 +81,9 @@ func kubelet(cfg *config.Agent) {
 	if cfg.CNIBinDir != "" {
 		argsMap["cni-bin-dir"] = cfg.CNIBinDir
 	}
+	if cfg.CNIPlugin {
+		argsMap["network-plugin"] = "cni"
+	}
 	if len(cfg.ClusterDNS) > 0 {
 		argsMap["cluster-dns"] = cfg.ClusterDNS.String()
 	}
@@ -87,18 +93,21 @@ func kubelet(cfg *config.Agent) {
 	if cfg.RuntimeSocket != "" {
 		argsMap["container-runtime"] = "remote"
 		argsMap["container-runtime-endpoint"] = cfg.RuntimeSocket
+		argsMap["containerd"] = cfg.RuntimeSocket
 		argsMap["serialize-image-pulls"] = "false"
+	} else if cfg.PauseImage != "" {
+		argsMap["pod-infra-container-image"] = cfg.PauseImage
 	}
 	if cfg.ListenAddress != "" {
 		argsMap["address"] = cfg.ListenAddress
 	}
-	if cfg.CACertPath != "" {
+	if cfg.ClientCA != "" {
 		argsMap["anonymous-auth"] = "false"
-		argsMap["client-ca-file"] = cfg.CACertPath
+		argsMap["client-ca-file"] = cfg.ClientCA
 	}
-	if cfg.NodeCertFile != "" && cfg.NodeKeyFile != "" {
-		argsMap["tls-cert-file"] = cfg.NodeCertFile
-		argsMap["tls-private-key-file"] = cfg.NodeKeyFile
+	if cfg.ServingKubeletCert != "" && cfg.ServingKubeletKey != "" {
+		argsMap["tls-cert-file"] = cfg.ServingKubeletCert
+		argsMap["tls-private-key-file"] = cfg.ServingKubeletKey
 	}
 	if cfg.NodeName != "" {
 		argsMap["hostname-override"] = cfg.NodeName
@@ -126,7 +135,24 @@ func kubelet(cfg *config.Agent) {
 		argsMap["feature-gates"] = addFeatureGate(argsMap["feature-gates"], "DevicePlugins=false")
 	}
 
+	argsMap["node-labels"] = strings.Join(cfg.NodeLabels, ",")
+	if len(cfg.NodeTaints) > 0 {
+		argsMap["register-with-taints"] = strings.Join(cfg.NodeTaints, ",")
+	}
+	if !cfg.DisableCCM {
+		argsMap["cloud-provider"] = "external"
+	}
+
+	if cfg.Rootless {
+		// flags are from https://github.com/rootless-containers/usernetes/blob/v20190826.0/boot/kubelet.sh
+		argsMap["cgroup-driver"] = "none"
+		argsMap["feature-gates=SupportNoneCgroupDriver"] = "true"
+		argsMap["cgroups-per-qos"] = "false"
+		argsMap["enforce-node-allocatable"] = ""
+	}
+
 	args := config.GetArgsList(argsMap, cfg.ExtraKubeletArgs)
+	command := kubelet.NewKubeletCommand(context.Background().Done())
 	command.SetArgs(args)
 
 	go func() {
@@ -169,6 +195,8 @@ func checkCgroups() (root string, hasCFS bool, hasPIDs bool) {
 				i := strings.LastIndex(last, ".slice")
 				if i > 0 {
 					root = "/systemd" + last[:i+len(".slice")]
+				} else {
+					root = "/systemd"
 				}
 			}
 		}
